@@ -250,6 +250,19 @@ int vp9_rc_clamp_iframe_target_size(const VP9_COMP *const cpi, int target) {
         (int64_t)rc->avg_frame_bandwidth * oxcf->rc_max_intra_bitrate_pct / 100;
     target = (int)VPXMIN(target, max_rate);
   }
+  // Default screen-content guard: both the VBR key-frame target (25x the
+  // per-frame bandwidth) and the boosted CBR target can exceed what the
+  // virtual buffer can cover. A key frame that large starves the following
+  // inter frames and produces the blur/sharpen pumping on screen shares.
+  // Unless the caller explicitly configured an intra bitrate cap, bound the
+  // key/intra-only frame to 8x per-frame bandwidth as a hard ceiling. The very
+  // first frame is exempt: it is sized from the starting buffer level and a
+  // high-quality initial key frame costs nothing in latency.
+  if (oxcf->content == VP9E_CONTENT_SCREEN &&
+      oxcf->rc_max_intra_bitrate_pct == 0 &&
+      cpi->common.current_video_frame > 0) {
+    target = (int)VPXMIN(target, (int64_t)8 * rc->avg_frame_bandwidth);
+  }
   if (target > rc->max_frame_bandwidth) target = rc->max_frame_bandwidth;
   return target;
 }
@@ -692,6 +705,37 @@ static int adjust_q_cbr(const VP9_COMP *cpi, int q) {
       q = (q + qclamp) >> 1;
     else
       q = qclamp;
+  }
+  // Screen content: limit the frame-to-frame QP swing. Motion on screen shares
+  // is highly bursty, so without a slope limit the QP jumps from low to
+  // worst_quality and back every couple of frames (the visible "sharpening
+  // back up" after motion stops). Allow a fast but bounded ramp instead.
+  // On the scene/slide-change frame itself (high_source_sad) allow an
+  // unconstrained upward jump so overshoot protection still wins, but always
+  // bound the downward recovery: a fast fall back to low QP is exactly the
+  // sharp-then-blurry pumping we are suppressing.
+  // The whole slope limit is suspended when the virtual buffer drops below
+  // its critical level: sustained hard motion can legitimately require a high
+  // QP for several frames, and clamping it there would overshoot the bitrate.
+  if (cpi->oxcf.content == VP9E_CONTENT_SCREEN &&
+      !cpi->rc.force_max_q && cpi->common.current_video_frame > 0 &&
+      cpi->rc.buffer_level > (cpi->rc.optimal_buffer_level >> 3)) {
+    static const int screen_max_qp_delta_up = 24;
+    static const int screen_max_qp_delta_down = 12;
+    const int prev_q = cpi->rc.last_q[INTER_FRAME];
+    const int requested_q = q;
+    if (!cpi->rc.high_source_sad && q > prev_q + screen_max_qp_delta_up)
+      q = prev_q + screen_max_qp_delta_up;
+    if (q < prev_q - screen_max_qp_delta_down)
+      q = prev_q - screen_max_qp_delta_down;
+    // Hard-content escape: a full buffer alone does not mean the current frame
+    // is cheap to encode. If rate control itself is asking for a high QP, let
+    // it keep a high absolute floor (3/4 of the QP range) so a genuinely
+    // difficult frame is not dragged down to the ramp value and forced to
+    // overshoot. This still removes the low-QP/high-QP ping-pong on ordinary
+    // motion, while preserving bitrate protection on hard frames.
+    if (requested_q >= (cpi->rc.worst_quality * 3) >> 2)
+      q = VPXMAX(q, (cpi->rc.worst_quality * 3) >> 2);
   }
   if (cpi->oxcf.content == VP9E_CONTENT_SCREEN &&
       cpi->oxcf.aq_mode == CYCLIC_REFRESH_AQ)
@@ -2228,6 +2272,22 @@ int vp9_calc_iframe_target_size_one_pass_cbr(const VP9_COMP *cpi) {
     }
 
     target = ((int64_t)(16 + kf_boost) * rc->avg_frame_bandwidth) >> 4;
+
+    // Screen content: a large key-frame target drains the virtual buffer and
+    // pushes the following inter frames up to worst_quality, which shows up as
+    // the blurry-then-sharp "pumping" while content is moving. Cap the key
+    // frame target against the available buffer headroom so inter frames keep
+    // a share of the budget. The cap only bites when the buffer cannot cover
+    // the boosted target; no lookahead is added, so latency is unchanged.
+    if (oxcf->content == VP9E_CONTENT_SCREEN &&
+        oxcf->rc_max_intra_bitrate_pct == 0) {
+      const int64_t buffer_headroom =
+          VPXMAX(rc->buffer_level, rc->optimal_buffer_level >> 2);
+      // At most 4x the per-frame bandwidth, and no more than the headroom.
+      const int64_t screen_kf_cap =
+          VPXMIN(buffer_headroom, (int64_t)4 * rc->avg_frame_bandwidth);
+      target = VPXMIN(target, screen_kf_cap);
+    }
   }
   target = VPXMIN(INT_MAX, target);
   return vp9_rc_clamp_iframe_target_size(cpi, (int)target);
